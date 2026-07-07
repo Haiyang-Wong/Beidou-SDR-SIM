@@ -1,80 +1,167 @@
-﻿/**
- * \file rinex.cpp
- * \brief RINEX 文件处理相关函数实现
- * \author LackWood Du
- * \date 2025-12-19
- */
-
 #include "bds_sdr.h"
-#pragma message("Compiling rinex.cpp")
-
-// ------------------ convertD2E ------------------
-// 将 RINEX 风格的 Fortran "D" 指数转换成 "E" 科学计数法
-// 例如 "-9.631020366214D-04" -> "-9.631020366214E-04"
-void convertD2E(char *line)
+static std::string convertD2E(std::string line)
 {
-    if (!line)
-        return;
-
-    for (char *p = line; *p != '\0'; ++p)
-    {
-        if (*p == 'D' || *p == 'd')
-        {
-            *p = 'E';
-        }
-    }
+    std::replace(line.begin(), line.end(), 'D', 'E');
+    std::replace(line.begin(), line.end(), 'd', 'E');
+    return line;
 }
 
-int readContentsData(char *str, double *data, datetime_t *time, bool read_time)
+static double readFixedDoubleField(const std::string &line, size_t offset, size_t width = 19)
 {
-    int Second;
+    if (offset >= line.size())
+        return 0.0;
+
+    const std::string field = line.substr(offset, std::min(width, line.size() - offset));
+    if (field.find_first_not_of(' ') == std::string::npos)
+        return 0.0;
+
+    std::istringstream iss(field);
+    double value = 0.0;
+    iss >> value;
+    return iss.fail() ? 0.0 : value;
+}
+
+int readContentsData(const std::string &line, double data[39], int data_offset, datetime_t *time)
+{
+    const std::string normalized_line = convertD2E(line);
     int svid = 0;
-    int length = strlen(str);
 
-    convertD2E(str);
+    if (time != nullptr)
+    {
+        std::istringstream time_stream(normalized_line.substr(4, 19));
+        time_stream >> time->y >> time->m >> time->d >> time->hh >> time->mm >> time->sec;
 
-    if (read_time)
-    {
-        sscanf(str + 4, "%d %d %d %d %d %d", &(time->y), &(time->m), &(time->d), &(time->hh), &(time->mm), &Second);
-        time->sec = (double)Second;
-        if (str[1] == ' ')
-            svid = 0;
-        else
-            sscanf(str + 1, "%2d", &svid);
-        if (length > 24 && str[24] != ' ')
-            sscanf(str + 23, "%lf", &data[0]);
-        else
-            data[0] = 0.0;
-        if (length > 43 && str[43] != ' ')
-            sscanf(str + 42, "%lf", &data[1]);
-        else
-            data[1] = 0.0;
-        if (length > 62 && str[62] != ' ')
-            sscanf(str + 61, "%lf", &data[2]);
-        else
-            data[2] = 0.0;
-    }
-    else
-    {
-        if (length > 5 & str[5] != ' ')
-            sscanf(str + 4, "%lf", &data[0]);
-        else
-            data[0] = 0.0;
-        if (length > 24 & str[24] != ' ')
-            sscanf(str + 23, "%lf", &data[1]);
-        else
-            data[1] = 0.0;
-        if (length > 43 && str[43] != ' ')
-            sscanf(str + 42, "%lf", &data[2]);
-        else
-            data[2] = 0.0;
-        if (length > 62 && str[62] != ' ')
-            sscanf(str + 61, "%lf", &data[3]);
-        else
-            data[3] = 0.0;
+        if (normalized_line.size() > 2)
+        {
+            std::istringstream svid_stream(normalized_line.substr(1, 2));
+            svid_stream >> svid;
+        }
+
+        data[data_offset] = readFixedDoubleField(normalized_line, 23);
+        data[data_offset + 1] = readFixedDoubleField(normalized_line, 42);
+        data[data_offset + 2] = readFixedDoubleField(normalized_line, 61);
+        return svid;
     }
 
+    data[data_offset] = readFixedDoubleField(normalized_line, 4);
+    data[data_offset + 1] = readFixedDoubleField(normalized_line, 23);
+    data[data_offset + 2] = readFixedDoubleField(normalized_line, 42);
+    data[data_offset + 3] = readFixedDoubleField(normalized_line, 61);
     return svid;
+}
+
+
+double normalizeBdsAngle(double angle)
+{
+    while (angle < -K_PI)
+        angle += 2.0 * K_PI;
+    while (angle >= K_PI)
+        angle -= 2.0 * K_PI;
+    return angle;
+}
+
+int alignBdsAlmanacToa4096(int toa, int *week)
+{
+    toa = (toa + 2048) / 4096 * 4096;
+
+    if (toa >= static_cast<int>(SECONDS_IN_WEEK))
+    {
+        toa -= static_cast<int>(SECONDS_IN_WEEK);
+        if (week != nullptr)
+            ++(*week);
+    }
+
+    return toa;
+}
+
+unsigned char getBdsSatTypeFromEphem(const ephem_t *eph)
+{
+    if (eph == nullptr)
+        return 0;
+
+    const double axis = (eph->axis > 0.0) ? eph->axis : eph->sqrt_a * eph->sqrt_a;
+
+    if (eph->svid <= 5 || eph->svid >= 59)
+        return 1;
+
+    return (axis > 4.0e7) ? 2 : 3;
+}
+
+ephem_t deriveBdsAlmanacFromEphem(const ephem_t *eph, int alm_week, int alm_toa)
+{
+    ephem_t alm{};
+    if (eph == nullptr)
+        return alm;
+
+    alm.valid = eph->valid & 1;
+    alm.health = static_cast<unsigned char>(eph->health);
+    alm.svid = eph->svid;
+
+    if ((alm.valid & 1) == 0)
+        return alm;
+
+    alm.flag = getBdsSatTypeFromEphem(eph);
+    alm.toa = alm_toa;
+    alm.week = alm_week;
+
+    const int dt = (alm_week - eph->week) * static_cast<int>(SECONDS_IN_WEEK) +
+                   (alm_toa - eph->toe);
+    const double axis = (eph->axis > 0.0) ? eph->axis : eph->sqrt_a * eph->sqrt_a;
+    const double mean_motion = (eph->n != 0.0 || eph->sqrt_a <= 0.0 || axis <= 0.0)
+                                   ? eph->n
+                                   : CGCS2000_SQRT_GM / (eph->sqrt_a * axis) + eph->delta_n;
+
+    alm.ecc = eph->ecc;
+    alm.sqrt_a = eph->sqrt_a;
+    alm.w = eph->w;
+    alm.omega_dot = eph->omega_dot;
+    alm.af1 = eph->af1;
+
+    alm.m0 = normalizeBdsAngle(eph->m0 + mean_motion * dt);
+    alm.omega0 = normalizeBdsAngle(eph->omega0 + eph->omega_dot * dt);
+    alm.i0 = eph->i0 + eph->idot * dt;
+    alm.af0 = eph->af0 + eph->af1 * dt;
+
+    return alm;
+}
+
+void completeBdsAlmanacFromEphem(
+    const ephem_t *eph_list[63],
+    ephem_t alm_out[63],
+    int current_bds_week,
+    int current_bds_tow_seconds)
+{
+    int alm_toa = -1;
+    int alm_week = current_bds_week;
+
+    for (int i = 0; i < 63; ++i)
+    {
+        if ((alm_out[i].valid & 1) != 0)
+        {
+            alm_toa = alm_out[i].toa;
+            alm_week = alm_out[i].week;
+            break;
+        }
+    }
+
+    if (alm_toa < 0)
+    {
+        alm_toa = current_bds_tow_seconds;
+        alm_week = current_bds_week;
+    }
+
+    alm_toa = alignBdsAlmanacToa4096(alm_toa, &alm_week);
+
+    for (int i = 0; i < 63; ++i)
+    {
+        if ((alm_out[i].valid & 1) != 0)
+            continue;
+        if (eph_list[i] == nullptr)
+            continue;
+        if ((eph_list[i]->valid & 1) == 0)
+            continue;
+        alm_out[i] = deriveBdsAlmanacFromEphem(eph_list[i], alm_week, alm_toa);
+    }
 }
 
 int readBdsB1CEphemerisCpp(
@@ -96,117 +183,100 @@ int readBdsB1CEphemerisCpp(
         if (line.empty())
             continue;
         if (line[0] != 'C' && line[0] != 'B')
-            continue; // BDS line start
+            continue;
 
         ephem_t eph{};
-        datetime_t ttmp{};
-        double data[4];
+        datetime_t epoch{};
+        double data[39]{};
 
-        char buf[200];
-        memset(buf, 0, sizeof(buf));
+        const int svid = readContentsData(line, data, 0, &epoch);
+        if (svid <= 0 || svid > MAX_SAT)
+            continue;
 
-        // -------------------- Line 1 --------------------
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        int svid = readContentsData(buf, data, &ttmp, true);
+        bool record_complete = true;
+        for (int row = 0; row < 7; ++row)
+        {
+            if (!std::getline(infile, line))
+            {
+                record_complete = false;
+                break;
+            }
 
-        eph.PRN = svid;
-        eph.svid = svid;
+            readContentsData(line, data, 3 + row * 4, nullptr);
+        }
+
+        if (!record_complete)
+            break;
+
+        eph.valid = 1;
+        eph.svid = static_cast<unsigned char>(svid);
+
+        {
+            bdstime_t toc_time{};
+            dateToBdt(&epoch, &toc_time);
+            eph.week = toc_time.week;
+            eph.toc = toc_time.milliseconds / BDS_MILLISECONDS_IN_SECOND;
+        }
 
         eph.af0 = data[0];
         eph.af1 = data[1];
         eph.af2 = data[2];
 
-        // convert UTC to BDT toc
-        date2bdt(&ttmp, &eph.toc);
+        eph.iode = static_cast<unsigned char>(data[3]);
+        eph.crs = data[4];
+        eph.delta_n = data[5];
+        eph.m0 = data[6];
 
-        // -------------------- Line 2 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
+        eph.cuc = data[7];
+        eph.ecc = data[8];
+        eph.cus = data[9];
+        eph.sqrt_a = data[10];
 
-        eph.iode = (int)data[0];
-        eph.crs = data[1];
-        eph.deltan = data[2];
-        eph.m0 = data[3];
+        eph.toe = static_cast<int>(data[11] + 0.5);
 
-        // -------------------- Line 3 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
+        eph.cic = data[12];
+        eph.omega0 = data[13];
+        eph.cis = data[14];
 
-        eph.cuc = data[0];
-        eph.ecc = data[1];
-        eph.cus = data[2];
-        eph.sqrta = data[3];
+        eph.i0 = data[15];
+        eph.crc = data[16];
+        eph.w = data[17];
+        eph.omega_dot = data[18];
 
-        // -------------------- Line 4 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
+        eph.idot = data[19];
+        eph.week = static_cast<int>(data[21]);
+        eph.health = (data[24] != 0.0) ? 0x80 : 0;
 
-        eph.toe.sec = (int)(data[0] + 0.5);
-        eph.cic = data[1];
-        eph.omg0 = data[2];
-        eph.cis = data[3];
+        eph.tgd = data[25];
 
-        // toe.week 无法从 B1C 获取，先置 0
-        eph.toe.week = 0;
+        eph.iodc = static_cast<unsigned short>(data[28]);
 
-        // -------------------- Line 5 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
+        eph.axis_dot = 0.0;
+        eph.delta_n_dot = 0.0;
 
-        eph.inc0 = data[0];
-        eph.crc = data[1];
-        eph.aop = data[2];
-        eph.omgdot = data[3];
+        eph.tgd_ext[0] = eph.tgd;
+        eph.tgd_ext[1] = eph.tgd;
+        eph.tgd_ext[2] = eph.tgd * TGD_GAMME_L5;
+        eph.tgd_ext[3] = eph.tgd * TGD_GAMME_L5;
+        eph.tgd_ext[4] = eph.tgd * TGD_GAMMA_E5B;
 
-        // -------------------- Line 6 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
+        eph.axis = eph.sqrt_a * eph.sqrt_a;
+        eph.n = CGCS2000_SQRT_GM / (eph.sqrt_a * eph.axis) + eph.delta_n;
+        eph.root_ecc = sqrt(1.0 - eph.ecc * eph.ecc);
 
-        eph.idot = data[0];
-        // data[1] = spare
-        eph.toe.week = (int)data[2]; // toe week
-        // data[3] = spare
+        if (eph.svid <= 5 || eph.svid >= 59)
+            eph.omega_delta = eph.omega_dot;
+        else
+            eph.omega_delta = eph.omega_dot - CGCS2000_OMEGDOTE;
 
-        // -------------------- Line 7 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
+        if (eph.svid <= 5 || eph.svid >= 59)
+            eph.flag = 1;
+        else if (eph.axis > 4e7)
+            eph.flag = 2;
+        else
+            eph.flag = 3;
 
-        eph.ura = data[0];
-        eph.svhlth = data[1];
-        eph.tgd1 = data[2];
-        eph.tgd2 = data[3];
-
-        // -------------------- Line 8 --------------------
-        if (!std::getline(infile, line))
-            break;
-        strncpy(buf, line.c_str(), sizeof(buf) - 1);
-        readContentsData(buf, data, nullptr, false);
-
-        eph.gps_time = data[0];
-        eph.IODC = (int)data[1];
-        // data[2], data[3] = spare
-
-        // ---------------- Derived parameters ----------------
-        eph.A = eph.sqrta * eph.sqrta;
-        eph.n = WGS_SQRT_GM / (eph.A * eph.sqrta) + eph.deltan;
-        eph.sq1e2 = sqrt(1.0 - eph.ecc * eph.ecc);
-        eph.omg_t = eph.omg0 - OMEGA_EARTH * eph.toe.sec;
-        eph.omgkdot = eph.omgdot - OMEGA_EARTH;
-        eph.vflg = 1;
-
-        eph_vec[eph.PRN - 1].push_back(eph);
+        eph_vec[eph.svid - 1].push_back(eph);
         count++;
     }
 
@@ -214,173 +284,83 @@ int readBdsB1CEphemerisCpp(
     return count;
 }
 
-// ------------------ printEphVec ------------------
-// 打印卫星星历信息
-void printEphVec(const std::vector<ephem_t> eph_vec[MAX_SAT])
-{
-    for (int prn = 0; prn < MAX_SAT; prn++)
-    {
-        if (eph_vec[prn].empty())
-            continue;
-
-        std::cout << "========== PRN " << prn + 1 << " ==========\n";
-
-        for (size_t i = 0; i < eph_vec[prn].size(); i++)
-        {
-            const ephem_t &e = eph_vec[prn][i];
-
-            std::cout << "\n----- Ephemeris #" << i + 1 << " -----\n";
-
-            // -------- Line 1 --------
-            std::cout << "Line1 PRN: " << e.PRN << "\n";
-            std::cout << "Line1 af0: " << e.af0 << "\n";
-            std::cout << "Line1 af1: " << e.af1 << "\n";
-            std::cout << "Line1 af2: " << e.af2 << "\n";
-            std::cout << "Line1 toc (week,sec): "
-                      << e.toc.week << ", " << e.toc.sec << "\n";
-
-            // -------- Line 2 --------
-            std::cout << "Line2 iode: " << e.iode << "\n";
-            std::cout << "Line2 crs: " << e.crs << "\n";
-            std::cout << "Line2 deltan: " << e.deltan << "\n";
-            std::cout << "Line2 m0: " << e.m0 << "\n";
-
-            // -------- Line 3 --------
-            std::cout << "Line3 cuc: " << e.cuc << "\n";
-            std::cout << "Line3 ecc: " << e.ecc << "\n";
-            std::cout << "Line3 cus: " << e.cus << "\n";
-            std::cout << "Line3 sqrtA: " << e.sqrta << "\n";
-
-            // -------- Line 4 --------
-            std::cout << "Line4 toe.sec: " << e.toe.sec << "\n";
-            std::cout << "Line4 cic: " << e.cic << "\n";
-            std::cout << "Line4 omg0: " << e.omg0 << "\n";
-            std::cout << "Line4 cis: " << e.cis << "\n";
-
-            // -------- Line 5 --------
-            std::cout << "Line5 inc0: " << e.inc0 << "\n";
-            std::cout << "Line5 crc: " << e.crc << "\n";
-            std::cout << "Line5 aop: " << e.aop << "\n";
-            std::cout << "Line5 omgdot: " << e.omgdot << "\n";
-
-            // -------- Line 6 --------
-            std::cout << "Line6 idot: " << e.idot << "\n";
-
-            // -------- Line 7 --------
-            std::cout << "Line7 ura: " << e.ura << "\n";
-            std::cout << "Line7 svhealth: " << e.svhlth << "\n";
-            std::cout << "Line7 tgd1: " << e.tgd1 << "\n";
-            std::cout << "Line7 tgd2: " << e.tgd2 << "\n";
-
-            // -------- Line 8 --------
-            std::cout << "Line8 gps_time: " << e.gps_time << "\n";
-            std::cout << "Line8 IODC: " << e.IODC << "\n";
-
-            // -------- Derived parameters --------
-            std::cout << "Derived A: " << e.A << "\n";
-            std::cout << "Derived n: " << e.n << "\n";
-            std::cout << "Derived sq1e2: " << e.sq1e2 << "\n";
-            std::cout << "Derived omg_t: " << e.omg_t << "\n";
-            std::cout << "Derived omgkdot: " << e.omgkdot << "\n";
-            std::cout << "Derived vflg: " << e.vflg << "\n";
-        }
-    }
-}
-
 /**
  * \brief 为给定的观测时间找到最合适的星历数据索引
- * \param[in] obsTime 观测时间（BDT时间格式）
+ * \param[in] obs_time 观测时间（BDT时间格式）
  * \param[in] eph 星历数据向量
  * \return 最合适的星历数据索引；如果没有找到合适的, 则返回 -1
  */
-int epoch_matcher(bdstime_t obsTime, vector<ephem_t> eph)
+int matchEpoch(bdstime_t obs_time, vector<ephem_t> eph)
 {
     int index = -1;
     double dt;
-    // 遍历所有的星历数据
     for (unsigned i = 0; i < eph.size(); i++)
     {
-        // 判断当前星历是否有效
-        if (eph.at(i).vflg == 1)
+        if (eph.at(i).valid == 1)
         {
-            // 计算观测时间和星历参考时间之间的差值, BDS星历更新周期为一个小时
-            dt = subBdsTime(obsTime, eph.at(i).toc);
-
-            // 如果时间差在±1小时范围内，认为找到了合适的星历
+            const bdstime_t toc_time = bdsTimeFromWeekSeconds(eph.at(i).week, eph.at(i).toc);
+            dt = subBdsTime(obs_time, toc_time);
             if (dt >= -SECONDS_IN_HOUR && dt < SECONDS_IN_HOUR)
             {
-                // cout << "EM: " << dt << " - " << eph.at(i).svid + 1 << endl;
                 index = i;
                 break;
             }
         }
     }
-    // Index of most appropriate Nav vector
-    // 返回合适的星历数据索引
     return index;
 }
 
 /**
  * \brief 计算星历的可信时间窗口
  */
-void compute_bdt_min_max(
+void computeBdtMinMax(
     const std::vector<ephem_t> eph_vector[MAX_SAT],
     bdstime_t *bdt_min,
     bdstime_t *bdt_max,
     datetime_t *tmin,
     datetime_t *tmax)
 {
-    int sv;
     int min_initialized = 0;
     int max_initialized = 0;
-    ephem_t eph;
-
-    /* ---------- 计算 bdt_min ---------- */
-    for (sv = 0; sv < MAX_SAT; sv++)
+    for (int sv = 0; sv < MAX_SAT; sv++)
     {
         if (eph_vector[sv].empty())
             continue;
 
-        eph = eph_vector[sv][0]; // 第一条星历（假定已按时间排序）
+        const ephem_t &eph = eph_vector[sv][0];
+        if (eph.valid != 1)
+            continue;
 
-        if (eph.vflg == 1)
+        const bdstime_t toc_time = bdsTimeFromWeekSeconds(eph.week, eph.toc);
+        if (!min_initialized || compareBdt(&toc_time, bdt_min) > 0)
         {
-            if (!min_initialized)
-            {
-                *bdt_min = eph.toc;
-                min_initialized = 1;
-            }
-            else if (bdt_cmp(&eph.toc, bdt_min) > 0)
-            {
-                *bdt_min = eph.toc;
-            }
+            *bdt_min = toc_time;
+            min_initialized = 1;
         }
     }
-
-    /* ---------- 计算 bdt_max ---------- */
-    for (sv = 0; sv < MAX_SAT; sv++)
+    for (int sv = 0; sv < MAX_SAT; sv++)
     {
         if (eph_vector[sv].size() < 2)
             continue;
 
-        eph = eph_vector[sv][eph_vector[sv].size() - 2]; // 倒数第二条
+        const ephem_t &eph = eph_vector[sv][eph_vector[sv].size() - 2];
+        if (eph.valid != 1)
+            continue;
 
-        if (eph.vflg == 1)
+        const bdstime_t toc_time = bdsTimeFromWeekSeconds(eph.week, eph.toc);
+        if (!max_initialized || compareBdt(&toc_time, bdt_max) > 0)
         {
-            if (!max_initialized)
-            {
-                *bdt_max = eph.toc;
-                max_initialized = 1;
-            }
-            else if (bdt_cmp(&eph.toc, bdt_max) > 0)
-            {
-                *bdt_max = eph.toc;
-            }
+            *bdt_max = toc_time;
+            max_initialized = 1;
         }
     }
-    // 转换为日期时间结构体
+    if (!max_initialized && min_initialized)
+    {
+        *bdt_max = *bdt_min;
+        max_initialized = 1;
+    }
     if (min_initialized != 0)
-        bdt2date(bdt_min, tmin);
+        bdtToDate(bdt_min, tmin);
     if (max_initialized != 0)
-        bdt2date(bdt_max, tmax);
+        bdtToDate(bdt_max, tmax);
 }

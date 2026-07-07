@@ -1,29 +1,19 @@
-﻿/**
- * \file geodesy.cpp
- * \brief GNSS 地球几何计算相关函数实现
- * \author LackWood Du
- * \date 2025-12-19
- */
-
 #include "bds_sdr.h"
-#pragma message("Compiling geodesy.cpp")
 
-bool isGEO(const int &PRN)
+bool isGEO(const int &prn)
 {
-    static const std::vector<int> geoPRNs = {
+    static const std::vector<int> geo_prns = {
         01, 02, 03, 04, 05, 59, 60, 61};
-    return std::find(geoPRNs.begin(), geoPRNs.end(), PRN) != geoPRNs.end();
+    return std::find(geo_prns.begin(), geo_prns.end(), prn) != geo_prns.end();
 }
 
-void satpos(
+void satPos(
     ephem_t eph,
     bdstime_t g,
     double *pos,
     double *vel,
     double *clk)
 {
-    // Computing Satellite Velocity using the Broadcast Ephemeris
-    // http://www.ngs.noaa.gov/gps-toolbox/bc_velo.htm
 
     double tk; // 当前时刻与卫星参考时间的差值
     double mk; // 平近点角
@@ -47,123 +37,76 @@ void satpos(
     double xpk, ypk;
     double xpkdot, ypkdot;
 
-    double relativistic, OneMinusecosE = 0, tmp;
+    double relativistic, one_minus_ecos_e = 0, tmp;
 
-    tk = g.sec - eph.toe.sec;
-    // tk = -14;
-
+    const bdstime_t toe_time = bdsTimeFromWeekSeconds(eph.week, eph.toe);
+    tk = subBdsTime(g, toe_time);
     if (tk > SECONDS_IN_HALF_WEEK)
         tk -= SECONDS_IN_WEEK;
     else if (tk < -SECONDS_IN_HALF_WEEK)
         tk += SECONDS_IN_WEEK;
-
-    // cout << "tk = " << tk << endl;
-
-    // 当前时刻的平近点角
     mk = eph.m0 + eph.n * tk;
-
-    // 以下过程通过迭代法，计算偏近点角 ek
     ek = mk;
     ekold = ek + 1.0;
 
     int cpt = 0;
-
-    // 开普勒方程： M = E - e*sin(E) ——M是平近点角、E是偏近点角、e是轨道离心率
-    // 对上述公式对时间T求导之后可得：M' = E' - e*cos(E)*E' ——M'是平均角速度n
-    // 因此可以得到： E' = n / (1 - e*cos(E)) ——(1 - e*cos(E))即OneMinusecosE
     while ((fabs(ek - ekold) > 1.0E-14) && cpt < 500)
     {
 
         cpt++;
         ekold = ek;
-        OneMinusecosE = 1.0 - eph.ecc * cos(ekold);
-        ek = ek + (mk - ekold + eph.ecc * sin(ekold)) / OneMinusecosE;
+        one_minus_ecos_e = 1.0 - eph.ecc * cos(ekold);
+        ek = ek + (mk - ekold + eph.ecc * sin(ekold)) / one_minus_ecos_e;
     }
-
-    // 计算偏近点角的正弦和余弦值
     sek = sin(ek);
     cek = cos(ek);
-
-    // 计算偏近点角E随时间的变化率
-    ekdot = eph.n / OneMinusecosE;
-
-    // 表示相对论改正项，单位是秒，用于修正卫星钟差，ecc是轨道离心率，sqrta是轨道半长轴的平方根，sek是偏近点角的正弦值
-    relativistic = -4.442807633E-10 * eph.ecc * eph.sqrta * sek;
-
-    // 轨道角aop是近地点幅角，是升交点到近地点的角度（轨道平面上计算）
-    pk = atan2(eph.sq1e2 * sek, cek - eph.ecc) + eph.aop;
-    pkdot = eph.sq1e2 * ekdot / OneMinusecosE;
+    ekdot = eph.n / one_minus_ecos_e;
+    relativistic = -4.442807633E-10 * eph.ecc * eph.sqrt_a * sek;
+    pk = atan2(eph.root_ecc * sek, cek - eph.ecc) + eph.w;
+    pkdot = eph.root_ecc * ekdot / one_minus_ecos_e;
 
     s2pk = sin(2.0 * pk);
     c2pk = cos(2.0 * pk);
-
-    // 计算卫星的修正轨道角
     uk = pk + eph.cus * s2pk + eph.cuc * c2pk;
-    // 轨道角的正余弦值
     suk = sin(uk);
     cuk = cos(uk);
-    // 轨道角的变化率
     ukdot = pkdot * (1.0 + 2.0 * (eph.cus * c2pk - eph.cuc * s2pk));
-
-    // 计算修正轨道半径及其变化率
-    rk = eph.A * OneMinusecosE + eph.crc * c2pk + eph.crs * s2pk;
-    rkdot = eph.A * eph.ecc * sek * ekdot + 2.0 * pkdot * (eph.crs * c2pk - eph.crc * s2pk);
-
-    // 计算卫星轨道倾角和其变化率
-    ik = eph.inc0 + eph.idot * tk + eph.cic * c2pk + eph.cis * s2pk;
+    rk = eph.axis * one_minus_ecos_e + eph.crc * c2pk + eph.crs * s2pk;
+    rkdot = eph.axis * eph.ecc * sek * ekdot + 2.0 * pkdot * (eph.crs * c2pk - eph.crc * s2pk);
+    ik = eph.i0 + eph.idot * tk + eph.cic * c2pk + eph.cis * s2pk;
     sik = sin(ik);
     cik = cos(ik);
     ikdot = eph.idot + 2.0 * pkdot * (eph.cis * c2pk - eph.cic * s2pk);
-
-    // 计算在卫星轨道平面内，卫星的坐标及其速度分量
     xpk = rk * cuk;
     ypk = rk * suk;
     xpkdot = rkdot * cuk - ypk * ukdot;
     ypkdot = rkdot * suk + xpk * ukdot;
-
-    // 计算升交点经度及其正余弦值
-    ok = eph.omg0 + tk * eph.omgkdot - OMEGA_EARTH * eph.toe.sec;
+    ok = eph.omega0 + tk * eph.omega_delta - OMEGA_EARTH * eph.toe;
     sok = sin(ok);
     cok = cos(ok);
-
-    // Compute position
-    // 卫星位置，ECEF坐标系中的x、y、z坐标
     pos[0] = xpk * cok - ypk * cik * sok;
     pos[1] = xpk * sok + ypk * cik * cok;
     pos[2] = ypk * sik;
 
     tmp = ypkdot * cik - ypk * sik * ikdot;
-
-    // Compute velocity
-    // 卫星速度，ECEF坐标系中的vx、vy、vz分量
-    vel[0] = -eph.omgkdot * pos[1] + xpkdot * cok - tmp * sok;
-    vel[1] = eph.omgkdot * pos[0] + xpkdot * sok + tmp * cok;
+    vel[0] = -eph.omega_delta * pos[1] + xpkdot * cok - tmp * sok;
+    vel[1] = eph.omega_delta * pos[0] + xpkdot * sok + tmp * cok;
     vel[2] = ypk * cik * ikdot + ypkdot * sik;
 
-    if (isGEO(eph.PRN))
-    { // 请根据您的实际数据结构修改此判断条件
-        // cout << "Applying GEO pole tide correction for PRN " << eph.PRN << endl;
+    if (isGEO(eph.svid))
+    {
         double fi = OMEGA_EARTH * tk;     // 计算地球自转角度修正参数
         double five = 180.0 / K_PI * 5.0; // 5度偏差角，转换为弧度
-
-        // 计算旋转所需的正余弦值
         double cos_fi = cos(fi);
         double sin_fi = sin(fi);
         double cos_five = cos(five);
         double sin_five = sin(five);
-
-        // 提取改正前的坐标
-        double X_old = pos[0];
-        double Y_old = pos[1];
-        double Z_old = pos[2];
-
-        // 应用极移改正矩阵（旋转顺序：先绕Z轴旋转 -five，再绕X轴旋转 fi）
-        // 这对应于 Python 代码中的 rx(fi) * rz(-five) * a.T
-        pos[0] = cos_five * X_old - sin_five * Y_old;
-        pos[1] = sin_five * cos_fi * X_old + cos_five * cos_fi * Y_old + sin_fi * Z_old;
-        pos[2] = -sin_five * sin_fi * X_old - cos_five * sin_fi * Y_old + cos_fi * Z_old;
-
-        // 注意：如果速度信息也需要同样的改正，请对 vel[0], vel[1], vel[2] 进行相同的矩阵变换
+        double x_old = pos[0];
+        double y_old = pos[1];
+        double z_old = pos[2];
+        pos[0] = cos_five * x_old - sin_five * y_old;
+        pos[1] = sin_five * cos_fi * x_old + cos_five * cos_fi * y_old + sin_fi * z_old;
+        pos[2] = -sin_five * sin_fi * x_old - cos_five * sin_fi * y_old + cos_fi * z_old;
         double vx_old = vel[0];
         double vy_old = vel[1];
         double vz_old = vel[2];
@@ -172,58 +115,24 @@ void satpos(
         vel[1] = sin_five * cos_fi * vx_old + cos_five * cos_fi * vy_old + sin_fi * vz_old;
         vel[2] = -sin_five * sin_fi * vx_old - cos_five * sin_fi * vy_old + cos_fi * vz_old;
     }
-
-    // Satellite clock correction
-    // 计算卫星钟差
-    tk = g.sec - eph.toc.sec;
+    const bdstime_t toc_time = bdsTimeFromWeekSeconds(eph.week, eph.toc);
+    tk = subBdsTime(g, toc_time);
 
     if (tk > SECONDS_IN_HALF_WEEK)
         tk -= SECONDS_IN_WEEK;
     else if (tk < -SECONDS_IN_HALF_WEEK)
         tk += SECONDS_IN_WEEK;
-
-    // 卫星的总钟差，即卫星钟多项式修正 + 相对论改正项 relativistic - 广播星历给定的 bgde5b 偏置
-    // af0：常数项偏差，表示卫星在参考时间 toc 的零时刻钟差
-    // af1 * tk：一阶项，卫星钟漂移率
-    // af2 * tk^2：二阶项，卫星钟加速度
-    // relativistic：相对论效应引起的钟差修正
-    // bgde5b：广播星历中给定的偏置值
-    // 卫星时钟相较于系统时钟的误差
     clk[0] = eph.af0 + tk * (eph.af1 + tk * eph.af2) + relativistic;
-
-    // 卫星钟差速率，上述公式对时间 tk 求导得到
     clk[1] = eph.af1 + 2.0 * tk * eph.af2;
 
     return;
 }
 
-void printSatState(const double *pos, const double *vel, const double *clk)
-{
-    std::cout << std::fixed << std::setprecision(6);
-
-    std::cout << "================ Satellite State ================\n";
-
-    std::cout << "Position (ECEF) [m]\n";
-    std::cout << "  X = " << std::setw(15) << pos[0] << "\n";
-    std::cout << "  Y = " << std::setw(15) << pos[1] << "\n";
-    std::cout << "  Z = " << std::setw(15) << pos[2] << "\n\n";
-
-    std::cout << "Velocity (ECEF) [m/s]\n";
-    std::cout << "  VX = " << std::setw(15) << vel[0] << "\n";
-    std::cout << "  VY = " << std::setw(15) << vel[1] << "\n";
-    std::cout << "  VZ = " << std::setw(15) << vel[2] << "\n\n";
-
-    std::cout << "Clock\n";
-    std::cout << "  Clock Bias   (s)  = " << std::setw(15) << clk[0] << "\n";
-    std::cout << "  Clock Drift  (s/s)= " << std::setw(15) << clk[1] << "\n";
-
-    std::cout << "=================================================\n";
-}
 
 /**
  * @brief 向量减法
  */
-void subVect(double *y, const double *x1, const double *x2)
+void subVector(double *y, const double *x1, const double *x2)
 {
     y[0] = x1[0] - x2[0];
     y[1] = x1[1] - x2[1];
@@ -235,7 +144,7 @@ void subVect(double *y, const double *x1, const double *x2)
 /**
  * @brief 计算向量模长
  */
-double normVect(const double *x)
+double normVector(const double *x)
 {
     return (sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]));
 }
@@ -255,9 +164,8 @@ void xyz2llh(const double *xyz, double *llh)
     eps = 1.0e-3;
     e2 = e * e;
 
-    if (normVect(xyz) < eps)
+    if (normVector(xyz) < eps)
     {
-        // Invalid ECEF vector
         llh[0] = 0.0;
         llh[1] = 0.0;
         llh[2] = -a;
@@ -396,7 +304,7 @@ void neu2azel(double *azel, const double *neu)
  * \param[in] eph 卫星星历数据
  * \param[in] g 当前时间
  * \param[in] xyz 接收机位置坐标
- * \param[in] elvMask（Elevation angle），单位是度，卫星与接收机连线处于水平时为0度，垂直向上时为90度，该变量用于屏蔽低仰角卫星
+ * \param[in] elv_mask（Elevation angle），单位是度，卫星与接收机连线处于水平时为0度，垂直向上时为90度，该变量用于屏蔽低仰角卫星
  * \param[out] azel 卫星方位角和仰角
  * \param[in] prn 卫星编号
  * \note 计算卫星相较于接收机的方位角和俯仰角，并根据设定的仰角掩膜判断卫星是否可见
@@ -407,29 +315,22 @@ int checkSatVisibility(
     double *xyz,
     double *azel,
     int prn,
-    double elvMask = 10) // checked
+    double elv_mask = 10)
 {
     double llh[3], neu[3];
     double pos[3], vel[3], clk[3], los[3];
     double tmat[3][3];
-    // 判断星历数据是否有效
-    if (eph.vflg != 1)
+    if (eph.valid != 1)
     {
         return (-1); // Invalid}
     }
     xyz2llh(xyz, llh);
     ltcmat(llh, tmat);
-    // 计算卫星位置、速度和时钟偏差，返回值分别存储在 pos、vel 和 clk 数组中
-    satpos(eph, g, pos, vel, clk);
-    // los = pos - xyz
-    subVect(los, pos, xyz);
-    // 将ECEF中的los，根据tmat转换为NEU坐标系（东北天坐标系）
+    satPos(eph, g, pos, vel, clk);
+    subVector(los, pos, xyz);
     ecef2neu(los, tmat, neu);
-    // 根据NEU坐标系下的los，计算卫星的方位角和仰角
     neu2azel(azel, neu);
-    // 判断卫星是否可见
-    if (azel[1] * R2D > elvMask)
+    if (azel[1] * R2D > elv_mask)
         return (1); // Visible
-    // else
     return (0); // Invisible
 }
